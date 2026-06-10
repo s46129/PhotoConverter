@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Image Batch Resizer – Web UI
-Supports: JPG, PNG, WEBP, BMP, TIFF, GIF, HEIF/HEIC/HIF
-Platforms: Windows, macOS, Linux
+PhotoConverter – Web UI
+One unified tool: colour-correct + optional resize for any image format.
+HIF/HEIF/HEIC: HDR tone-mapping applied automatically.
+Other formats: ICC profile converted to sRGB.
 
-Run:  python image_resizer.py
-Then open:  http://localhost:5000
+Platforms: Windows, macOS, Linux
+Run:  python image_resizer.py  →  http://localhost:5000
 """
 
-import threading
+import io as _io
 import subprocess
-import webbrowser
 import sys
+import threading
+import webbrowser
 from pathlib import Path
 
 try:
@@ -19,41 +21,33 @@ try:
     from PIL import Image, ImageOps, UnidentifiedImageError
     import pillow_heif
 except ImportError:
-    print("Missing packages. Run: pip install flask pillow pillow-heif")
+    print("Missing packages. Run: pip install flask pillow pillow-heif numpy")
     sys.exit(1)
 
 pillow_heif.register_heif_opener()
 
-# Import HIF converter pipeline
-try:
-    from convert_hif_to_jpg import (
-        _hdr_pq_to_srgb, _icc_to_srgb, _auto_levels,
-        _apply_style, _is_pq_hdr, _STYLES,
-        SUPPORTED_EXTENSIONS as HIF_EXTENSIONS,
-    )
-    _HIF_AVAILABLE = True
-except ImportError:
-    _HIF_AVAILABLE = False
+from convert_hif_to_jpg import (
+    _hdr_pq_to_srgb, _icc_to_srgb, _auto_levels,
+    _apply_style, _is_pq_hdr, _STYLES,
+    SUPPORTED_EXTENSIONS as _HIF_EXT,
+)
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 
 app = Flask(__name__)
 
-# ── Supported input formats ──────────────────────────────────────────────────
+# ── Supported formats ────────────────────────────────────────────────────────
 SUPPORTED_INPUT = {
     ".jpg", ".jpeg", ".png", ".webp",
     ".bmp", ".tiff", ".tif", ".gif",
-    ".hif", ".heif", ".heic",
-}
+} | _HIF_EXT
 
 FORMAT_EXT = {"same": None, "jpg": ".jpg", "png": ".png", "webp": ".webp"}
 
-# ── Global job state ─────────────────────────────────────────────────────────
+# ── Job state ────────────────────────────────────────────────────────────────
 _lock = threading.Lock()
-_job: dict = dict(
-    running=False, total=0, done=0,
-    current="", results=[], cancelled=False, error=None,
-)
+_job: dict = dict(running=False, total=0, done=0,
+                   current="", results=[], cancelled=False, error=None)
 
 
 def _snapshot():
@@ -63,136 +57,146 @@ def _snapshot():
     return j
 
 
-# ── Cross-platform folder browser (tkinter subprocess) ───────────────────────
+# ── Cross-platform folder browser ────────────────────────────────────────────
 def _browse_folder() -> str:
-    """
-    Open a native folder-picker dialog.
-    Runs tkinter in a subprocess so it is safe to call from Flask worker threads.
-    Works on Windows, macOS, and Linux (requires tkinter, which ships with Python).
-    """
+    # Write the path as raw UTF-8 bytes to stdout.buffer so it survives any
+    # system code-page (e.g. cp950 / cp1252 can't encode Chinese characters).
     script = (
-        "import tkinter as tk; from tkinter import filedialog; "
-        "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True); "
-        "path = filedialog.askdirectory(title='Select Folder'); "
-        "root.destroy(); print(path or '', end='')"
+        "import sys, tkinter as tk; from tkinter import filedialog; "
+        "root=tk.Tk(); root.withdraw(); root.attributes('-topmost',True); "
+        "path=filedialog.askdirectory(title='Select Folder'); "
+        "root.destroy(); "
+        "sys.stdout.buffer.write((path or '').encode('utf-8'))"
     )
     try:
         r = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, timeout=120,   # capture_output=True, no text=True → raw bytes
         )
-        return r.stdout.strip()
+        return r.stdout.decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
 
 
-# ── Input validation ─────────────────────────────────────────────────────────
-_MAX_DIMENSION = 32000   # pixels – guards against memory-bomb inputs
-_MAX_PERCENT   = 500
+# ── Validation helpers ────────────────────────────────────────────────────────
+_MAX_DIM = 32000
 
 
-def _safe_int(value, name: str, lo: int = 1, hi: int = _MAX_DIMENSION) -> int:
+def _safe_int(v, name, lo=1, hi=_MAX_DIM):
     try:
-        v = int(value)
+        n = int(v)
     except (TypeError, ValueError):
-        raise ValueError(f"'{name}' must be an integer (got {value!r})")
-    if not lo <= v <= hi:
-        raise ValueError(f"'{name}' must be between {lo} and {hi} (got {v})")
-    return v
+        raise ValueError(f"'{name}' must be an integer (got {v!r})")
+    if not lo <= n <= hi:
+        raise ValueError(f"'{name}' must be {lo}–{hi} (got {n})")
+    return n
 
 
-def _safe_float(value, name: str, lo: float = 0.1, hi: float = _MAX_PERCENT) -> float:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"'{name}' must be a number (got {value!r})")
-    if not lo <= v <= hi:
-        raise ValueError(f"'{name}' must be between {lo} and {hi} (got {v})")
-    return v
-
-
-def _safe_path(raw: str, must_exist: bool = False) -> Path:
-    """Resolve and validate a user-supplied path (prevents path traversal)."""
+def _safe_path(raw, must_exist=False):
     p = Path(raw).resolve()
     if must_exist and not p.exists():
         raise ValueError(f"Path does not exist: {p}")
     return p
 
 
-# ── Core resize logic ─────────────────────────────────────────────────────────
-def _compute_new_size(orig_w: int, orig_h: int, params: dict) -> tuple[int, int] | None:
-    """Return (new_w, new_h) or None (when thumbnail/fit handles it)."""
-    if orig_w <= 0 or orig_h <= 0:
-        raise ValueError(f"Invalid source dimensions: {orig_w}×{orig_h}")
-    mode = params["mode"]
-    if mode == "width":
-        w = _safe_int(params["target_w"], "width")
-        return (w, max(1, round(orig_h * w / orig_w)))
-    if mode == "height":
-        h = _safe_int(params["target_h"], "height")
-        return (max(1, round(orig_w * h / orig_h)), h)
-    if mode == "percent":
-        p = _safe_float(params["percent"], "percent") / 100
-        return (max(1, round(orig_w * p)), max(1, round(orig_h * p)))
-    if mode == "exact":
-        return None   # handled inline in _resize_one
-    raise ValueError(f"Unknown resize mode: {mode!r}")
-
-
+# ── Unified processing pipeline ───────────────────────────────────────────────
 def _out_ext(src: Path, fmt: str) -> str:
     if fmt == "same":
         ext = src.suffix.lower()
-        return ".jpg" if ext in {".hif", ".heif", ".heic"} else ext
+        return ".jpg" if ext in _HIF_EXT else ext
     return FORMAT_EXT[fmt]
 
 
-def _resize_one(src: Path, dst_base: Path, params: dict) -> None:
-    ext     = _out_ext(src, params["fmt"])
-    dst     = dst_base.with_suffix(ext)
-    quality = _safe_int(params.get("quality", 90), "quality", lo=1, hi=95)
-    mode    = params["mode"]
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        img = Image.open(src)
-    except UnidentifiedImageError:
-        raise ValueError(f"Unrecognised image format: {src.name}")
-
-    if mode == "exact":
-        tw       = _safe_int(params["target_w"], "width")
-        th       = _safe_int(params["target_h"], "height")
-        fit_mode = params.get("fit", "contain")
-        if fit_mode == "stretch":
-            img = img.resize((tw, th), Image.LANCZOS)
-        elif fit_mode == "cover":
-            img = ImageOps.fit(img, (tw, th), Image.LANCZOS)
-        else:                          # contain / letterbox
-            img.thumbnail((tw, th), Image.LANCZOS)
+def _process_file(src: Path, dst_base: Path, params: dict) -> None:
+    """
+    One function handles everything:
+      1. Open  (any format, HIF via pillow-heif)
+      2. Colour correct  (HIF → HDR pipeline; others → ICC→sRGB)
+      3. Style  (contrast / saturation)
+      4. Resize  (optional)
+      5. Save
+    """
+    # ── 1. Open & colour-correct ──────────────────────────────────────────────
+    if src.suffix.lower() in _HIF_EXT:
+        heif_file = pillow_heif.read_heif(str(src))
+        heif_img  = heif_file[0]
+        nclx      = heif_img.info.get("nclx_profile")
+        img       = heif_img.to_pillow()
+        img       = _hdr_pq_to_srgb(img) if _is_pq_hdr(nclx) else _auto_levels(_icc_to_srgb(img))
     else:
-        new_size = _compute_new_size(*img.size, params)
-        img = img.resize(new_size, Image.LANCZOS)
+        try:
+            img = Image.open(src)
+        except UnidentifiedImageError:
+            raise ValueError(f"Unrecognised image: {src.name}")
+        img = _icc_to_srgb(img)
 
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # ── 2. Style ──────────────────────────────────────────────────────────────
+    style    = params.get("style", "accurate")
+    contrast, saturation = _STYLES.get(style, (1.0, 1.0))
+    # Allow per-job fine-tuning overrides (from the web UI sliders)
+    if "contrast"   in params:
+        contrast   = max(0.01, min(10.0, float(params["contrast"])))
+    if "saturation" in params:
+        saturation = max(0.01, min(10.0, float(params["saturation"])))
+    img = _apply_style(img, contrast, saturation)
+
+    # ── 3. Resize (optional) ──────────────────────────────────────────────────
+    rp = params.get("resize")   # None = no resize
+    if rp:
+        mode = rp.get("mode", "width")
+        ow, oh = img.size
+        if ow <= 0 or oh <= 0:
+            raise ValueError(f"Invalid source dimensions: {ow}×{oh}")
+
+        if mode == "width":
+            w = _safe_int(rp["target_w"], "width")
+            img = img.resize((w, max(1, round(oh * w / ow))), Image.LANCZOS)
+        elif mode == "height":
+            h = _safe_int(rp["target_h"], "height")
+            img = img.resize((max(1, round(ow * h / oh)), h), Image.LANCZOS)
+        elif mode == "percent":
+            p = max(0.01, float(rp.get("percent", 50))) / 100
+            img = img.resize((max(1, round(ow * p)), max(1, round(oh * p))), Image.LANCZOS)
+        elif mode == "exact":
+            tw  = _safe_int(rp["target_w"], "width")
+            th  = _safe_int(rp["target_h"], "height")
+            fit = rp.get("fit", "contain")
+            if fit == "stretch":
+                img = img.resize((tw, th), Image.LANCZOS)
+            elif fit == "cover":
+                img = ImageOps.fit(img, (tw, th), Image.LANCZOS)
+            else:
+                img.thumbnail((tw, th), Image.LANCZOS)
+
+    # ── 4. Save ───────────────────────────────────────────────────────────────
+    ext     = _out_ext(src, params.get("fmt", "jpg"))
+    dst     = dst_base.with_suffix(ext)
     out_fmt = ext.lstrip(".").upper()
     if out_fmt == "JPG":
         out_fmt = "JPEG"
-
     if out_fmt in ("JPEG", "WEBP") and img.mode in ("RGBA", "P", "LA"):
         img = img.convert("RGB")
     elif out_fmt == "PNG" and img.mode == "P":
         img = img.convert("RGBA")
 
-    kw: dict = {}
-    if out_fmt == "JPEG":
-        kw = {"quality": quality, "subsampling": 0}
-    elif out_fmt == "WEBP":
-        kw = {"quality": quality}
+    quality = _safe_int(params.get("quality", 90), "quality", lo=1, hi=95)
+    kw = ({"quality": quality, "subsampling": 0} if out_fmt == "JPEG"
+          else {"quality": quality}               if out_fmt == "WEBP"
+          else {})
 
+    dst.parent.mkdir(parents=True, exist_ok=True)
     img.save(dst, format=out_fmt, **kw)
 
 
-# ── Background worker ────────────────────────────────────────────────────────
-def _worker(input_dir: Path, output_dir: Path, params: dict, files: list[Path]) -> None:
+# ── Background worker ─────────────────────────────────────────────────────────
+def _worker(input_dir: Path, output_dir: Path,
+            params: dict, files: list[Path]) -> None:
     global _job
+    overwrite = params.get("overwrite", False)
+
     for i, src in enumerate(files):
         with _lock:
             if _job["cancelled"]:
@@ -204,20 +208,20 @@ def _worker(input_dir: Path, output_dir: Path, params: dict, files: list[Path]) 
         dst_base = output_dir / rel.parent / rel.stem
 
         try:
-            ext       = _out_ext(src, params["fmt"])
-            dst_final = dst_base.with_suffix(ext)
-
-            if dst_final.exists() and not params.get("overwrite"):
+            ext   = _out_ext(src, params.get("fmt", "jpg"))
+            final = dst_base.with_suffix(ext)
+            if final.exists() and not overwrite:
                 with _lock:
                     _job["results"].append({"name": src.name, "status": "skipped"})
                 continue
 
-            _resize_one(src, dst_base, params)
+            _process_file(src, dst_base, params)
             with _lock:
                 _job["results"].append({"name": src.name, "status": "ok"})
         except Exception as exc:
             with _lock:
-                _job["results"].append({"name": src.name, "status": "error", "msg": str(exc)})
+                _job["results"].append({"name": src.name, "status": "error",
+                                         "msg": type(exc).__name__})
 
     with _lock:
         _job["done"]    = len(files)
@@ -225,7 +229,7 @@ def _worker(input_dir: Path, output_dir: Path, params: dict, files: list[Path]) 
         _job["running"] = False
 
 
-# ── Flask routes ─────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -243,20 +247,24 @@ def browse():
 @app.route("/api/scan", methods=["POST"])
 def scan():
     data    = request.json or {}
-    folder  = Path(data.get("folder", ""))
     recurse = data.get("recurse", False)
-    if not folder.is_dir():
-        return jsonify({"ok": False, "error": "Folder not found"})
+    try:
+        folder = _safe_path(data.get("folder", ""), must_exist=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
     pattern = "**/*" if recurse else "*"
     files   = [f for f in folder.glob(pattern)
                if f.is_file() and f.suffix.lower() in SUPPORTED_INPUT]
-    preview = [f.name for f in files[:5]]
-    extra   = max(0, len(files) - 5)
-    return jsonify({"ok": True, "count": len(files), "preview": preview, "extra": extra})
+
+    hif_count = sum(1 for f in files if f.suffix.lower() in _HIF_EXT)
+    preview   = [f.name for f in files[:5]]
+    return jsonify({"ok": True, "count": len(files), "hif_count": hif_count,
+                    "preview": preview, "extra": max(0, len(files) - 5)})
 
 
-@app.route("/api/resize", methods=["POST"])
-def start_resize():
+@app.route("/api/convert", methods=["POST"])
+def start_convert():
     global _job
     with _lock:
         if _job["running"]:
@@ -272,11 +280,7 @@ def start_resize():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)})
 
-    if not input_dir.is_dir():
-        return jsonify({"ok": False, "error": "Input folder not found"})
-
     output_dir.mkdir(parents=True, exist_ok=True)
-
     pattern = "**/*" if recurse else "*"
     files   = [f for f in input_dir.glob(pattern)
                if f.is_file() and f.suffix.lower() in SUPPORTED_INPUT]
@@ -289,9 +293,7 @@ def start_resize():
                     current="", results=[], cancelled=False, error=None)
 
     threading.Thread(
-        target=_worker,
-        args=(input_dir, output_dir, params, files),
-        daemon=True,
+        target=_worker, args=(input_dir, output_dir, params, files), daemon=True
     ).start()
 
     return jsonify({"ok": True, "total": len(files)})
@@ -309,153 +311,13 @@ def cancel():
     return jsonify({"ok": True})
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  HIF Converter routes
-# ════════════════════════════════════════════════════════════════════════════
-
-_hif_lock = threading.Lock()
-_hif_job: dict = dict(running=False, total=0, done=0,
-                       current="", results=[], cancelled=False, error=None)
-
-
-def _hif_snapshot():
-    with _hif_lock:
-        j = dict(_hif_job)
-        j["results"] = list(_hif_job["results"])
-    return j
-
-
-def _hif_convert_one(src: Path, dst: Path, style: str, quality: int) -> None:
-    heif_file = pillow_heif.read_heif(str(src))
-    heif_img  = heif_file[0]
-    nclx      = heif_img.info.get("nclx_profile")
-    image     = heif_img.to_pillow()
-
-    if _is_pq_hdr(nclx):
-        image = _hdr_pq_to_srgb(image)
-    else:
-        image = _icc_to_srgb(image)
-        image = _auto_levels(image)
-
-    contrast, saturation = _STYLES[style]
-    image = _apply_style(image, contrast, saturation)
-
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    image.save(dst, format="JPEG", quality=quality, subsampling=0)
-
-
-def _hif_worker(input_dir: Path, output_dir: Path,
-                style: str, quality: int, files: list[Path]) -> None:
-    global _hif_job
-    for i, src in enumerate(files):
-        with _hif_lock:
-            if _hif_job["cancelled"]:
-                break
-            _hif_job["done"]    = i
-            _hif_job["current"] = src.name
-
-        rel = src.relative_to(input_dir)
-        dst = output_dir / rel.with_suffix(".jpg")
-
-        try:
-            if dst.exists() and not _hif_job.get("overwrite"):
-                with _hif_lock:
-                    _hif_job["results"].append({"name": src.name, "status": "skipped"})
-                continue
-            _hif_convert_one(src, dst, style, quality)
-            with _hif_lock:
-                _hif_job["results"].append({"name": src.name, "status": "ok"})
-        except Exception as exc:
-            with _hif_lock:
-                _hif_job["results"].append({"name": src.name, "status": "error",
-                                             "msg": type(exc).__name__})
-
-    with _hif_lock:
-        _hif_job["done"]    = len(files)
-        _hif_job["current"] = ""
-        _hif_job["running"] = False
-
-
-@app.route("/api/hif/styles")
-def hif_styles():
-    styles = [{"id": k, "contrast": v[0], "saturation": v[1]}
-              for k, v in _STYLES.items()]
-    return jsonify({"ok": True, "styles": styles,
-                    "available": _HIF_AVAILABLE})
-
-
-@app.route("/api/hif/scan", methods=["POST"])
-def hif_scan():
-    data    = request.json or {}
-    folder  = Path(data.get("folder", ""))
-    recurse = data.get("recurse", False)
-    if not folder.is_dir():
-        return jsonify({"ok": False, "error": "Folder not found"})
-    pattern = "**/*" if recurse else "*"
-    files   = [f for f in folder.glob(pattern)
-               if f.is_file() and f.suffix.lower() in HIF_EXTENSIONS]
-    preview = [f.name for f in files[:5]]
-    return jsonify({"ok": True, "count": len(files),
-                    "preview": preview, "extra": max(0, len(files) - 5)})
-
-
-@app.route("/api/hif/convert", methods=["POST"])
-def hif_convert():
-    global _hif_job
-    if not _HIF_AVAILABLE:
-        return jsonify({"ok": False, "error": "convert_hif_to_jpg.py not found"})
-    with _hif_lock:
-        if _hif_job["running"]:
-            return jsonify({"ok": False, "error": "A job is already running"})
-
-    data    = request.json or {}
-    style   = data.get("style", "standard")
-    quality = _safe_int(data.get("quality", 90), "quality", lo=1, hi=95)
-    recurse = data.get("recurse", False)
-
-    if style not in _STYLES:
-        return jsonify({"ok": False, "error": f"Unknown style: {style!r}"})
-
-    try:
-        input_dir  = _safe_path(data.get("input_folder", ""), must_exist=True)
-        output_dir = _safe_path(data.get("output_folder", ""))
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)})
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pattern = "**/*" if recurse else "*"
-    files   = [f for f in input_dir.glob(pattern)
-               if f.is_file() and f.suffix.lower() in HIF_EXTENSIONS]
-    if not files:
-        return jsonify({"ok": False, "error": "No HIF/HEIF/HEIC files found"})
-
-    with _hif_lock:
-        _hif_job = dict(running=True, total=len(files), done=0,
-                        current="", results=[], cancelled=False,
-                        overwrite=data.get("overwrite", False), error=None)
-
-    threading.Thread(
-        target=_hif_worker,
-        args=(input_dir, output_dir, style, quality, files),
-        daemon=True,
-    ).start()
-
-    return jsonify({"ok": True, "total": len(files)})
-
-
-@app.route("/api/hif/status")
-def hif_status():
-    return jsonify(_hif_snapshot())
-
-
-@app.route("/api/hif/cancel", methods=["POST"])
-def hif_cancel():
-    with _hif_lock:
-        _hif_job["cancelled"] = True
-    return jsonify({"ok": True})
+@app.route("/api/styles")
+def styles():
+    return jsonify({
+        "ok": True,
+        "styles": [{"id": k, "contrast": v[0], "saturation": v[1]}
+                   for k, v in _STYLES.items()]
+    })
 
 
 @app.route("/samples/<path:filename>")
@@ -465,14 +327,13 @@ def samples(filename):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     url = "http://localhost:5000"
-    print("=" * 40)
-    print("  圖片批次縮放工具")
-    print(f"  網址: {url}")
-    print("  瀏覽器即將自動開啟...")
-    print("  關閉此視窗即可停止伺服器")
-    print("=" * 40)
+    print("=" * 42)
+    print("  PhotoConverter  v" + __version__)
+    print(f"  {url}")
+    print("  Browser opening automatically…")
+    print("  Close this window to stop the server")
+    print("=" * 42)
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     app.run(debug=False, port=5000, threaded=True)
