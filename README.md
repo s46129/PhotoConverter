@@ -21,7 +21,7 @@ A Python toolkit for **colour-correct batch conversion and resizing** of photos 
 
 #### Step 1 — Download
 
-1. Click the green **Code** button near the top of this page → **Download ZIP**
+1. **[⬇ Download PhotoConverter.zip](https://github.com/s46129/PhotoConverter/archive/refs/heads/master.zip)** — the ZIP downloads automatically
 2. Extract the ZIP to any folder (e.g. your Desktop)
 3. Open the extracted `PhotoConverter` folder — the launcher files are right inside:
 
@@ -229,7 +229,7 @@ MIT © 2026 Rex Ying (ted56129@gmail.com)
 
 #### 步驟一：下載程式
 
-1. 點擊本頁上方綠色的 **Code** 按鈕 → **Download ZIP**
+1. **[⬇ 點此下載 PhotoConverter.zip](https://github.com/s46129/PhotoConverter/archive/refs/heads/master.zip)** — 點擊連結，ZIP 會自動下載
 2. 將 ZIP 解壓縮到任意位置（例如桌面）
 3. 開啟解壓縮後的 `PhotoConverter` 資料夾，啟動器就在裡面：
 
