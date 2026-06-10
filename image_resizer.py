@@ -9,6 +9,7 @@ Platforms: Windows, macOS, Linux
 Run:  python image_resizer.py  →  http://localhost:5000
 """
 
+import base64
 import io as _io
 import subprocess
 import sys
@@ -48,6 +49,9 @@ FORMAT_EXT = {"same": None, "jpg": ".jpg", "png": ".png", "webp": ".webp"}
 _lock = threading.Lock()
 _job: dict = dict(running=False, total=0, done=0,
                    current="", results=[], cancelled=False, error=None)
+
+# ── Preview cache (path → data-URL JPEG, survives for the server session) ────
+_preview_cache: dict = {}
 
 
 def _snapshot():
@@ -253,14 +257,85 @@ def scan():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)})
 
-    pattern = "**/*" if recurse else "*"
-    files   = [f for f in folder.glob(pattern)
-               if f.is_file() and f.suffix.lower() in SUPPORTED_INPUT]
-
-    hif_count = sum(1 for f in files if f.suffix.lower() in _HIF_EXT)
+    pattern   = "**/*" if recurse else "*"
+    files     = [f for f in folder.glob(pattern)
+                 if f.is_file() and f.suffix.lower() in SUPPORTED_INPUT]
+    hif_files = [f for f in files if f.suffix.lower() in _HIF_EXT]
+    hif_count = len(hif_files)
     preview   = [f.name for f in files[:5]]
-    return jsonify({"ok": True, "count": len(files), "hif_count": hif_count,
-                    "preview": preview, "extra": max(0, len(files) - 5)})
+
+    # Return up to 20 HIF relative paths for the preview selector in the UI
+    _MAX_HIF_SEL = 20
+    hif_rel = [str(f.relative_to(folder)).replace("\\", "/")
+               for f in hif_files[:_MAX_HIF_SEL]]
+
+    return jsonify({
+        "ok":       True,
+        "count":    len(files),
+        "hif_count": hif_count,
+        "preview":  preview,
+        "extra":    max(0, len(files) - 5),
+        "hif_files": hif_rel,
+        "hif_extra": max(0, hif_count - _MAX_HIF_SEL),
+    })
+
+
+@app.route("/api/preview", methods=["POST"])
+def preview_image():
+    """
+    Process a single image through the colour-correction pipeline
+    (HDR tone-map for HIF, ICC→sRGB for others) and return it as a
+    base64-encoded JPEG data-URL — no style applied, so the browser
+    can layer CSS filter on top for live fine-tuning preview.
+
+    Results are cached for the lifetime of the server session so that
+    switching between files is instant after the first load.
+    """
+    data = request.json or {}
+    try:
+        src = _safe_path(data.get("file", ""), must_exist=True)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+    if src.suffix.lower() not in SUPPORTED_INPUT:
+        return jsonify({"ok": False, "error": f"Unsupported format: {src.suffix}"})
+
+    cache_key = str(src)
+    if cache_key in _preview_cache:
+        return jsonify({"ok": True, "data": _preview_cache[cache_key], "cached": True})
+
+    try:
+        # ── Colour-correct (identical to _process_file step 1) ──────────────
+        if src.suffix.lower() in _HIF_EXT:
+            heif_file = pillow_heif.read_heif(str(src))
+            heif_img  = heif_file[0]
+            nclx      = heif_img.info.get("nclx_profile")
+            img       = heif_img.to_pillow()
+            img       = _hdr_pq_to_srgb(img) if _is_pq_hdr(nclx) else _auto_levels(_icc_to_srgb(img))
+        else:
+            img = Image.open(src)
+            img = _icc_to_srgb(img)
+
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        # ── Downscale for preview (max 1200 px on the long side) ────────────
+        w, h   = img.size
+        max_px = 1200
+        if max(w, h) > max_px:
+            scale = max_px / max(w, h)
+            img   = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                               Image.LANCZOS)
+
+        # ── Encode as base64 JPEG data-URL ───────────────────────────────────
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, subsampling=0)
+        data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        _preview_cache[cache_key] = data_url
+        return jsonify({"ok": True, "data": data_url})
+
+    except Exception as exc:
+        return jsonify({"ok": False, "error": type(exc).__name__})
 
 
 @app.route("/api/convert", methods=["POST"])

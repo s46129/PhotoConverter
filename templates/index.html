@@ -154,6 +154,17 @@
                    border-radius:999px; padding:.18rem .6rem;
                    font-size:.75rem; font-weight:600; }
 
+    /* ── Preview photo selector ── */
+    .preview-chip { display:inline-flex; align-items:center; padding:.25rem .7rem;
+                    border-radius:999px; border:1.5px solid #e2e8f0; background:#fff;
+                    font-size:.78rem; font-weight:500; color:#64748b; cursor:pointer;
+                    transition:all .15s; white-space:nowrap;
+                    max-width:180px; overflow:hidden; text-overflow:ellipsis; }
+    .preview-chip:hover { border-color:var(--accent); color:var(--accent); }
+    .preview-chip.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .preview-loading { display:flex; align-items:center; gap:.4rem;
+                       font-size:.78rem; color:#94a3b8; }
+
     /* ── Resize toggle ── */
     .resize-toggle-row { display:flex; align-items:center; gap:.65rem;
                          cursor:pointer; padding:.4rem 0; user-select:none; }
@@ -282,6 +293,22 @@
       <div class="hif-info-bar" id="hifInfoBar">
         <i class="bi bi-stars"></i>
         <span id="hifInfoText">HIF files detected — select a colour style below.</span>
+      </div>
+
+      <!-- Preview photo selector -->
+      <div class="mb-3">
+        <span class="p-label" data-i18n="previewWith">Preview with:</span>
+        <div class="d-flex flex-wrap gap-2 mt-2 align-items-center" id="previewChips">
+          <button class="preview-chip active" onclick="useSamplePreview()">
+            <i class="bi bi-image me-1"></i>
+            <span data-i18n="samplePhoto">Sample photo</span>
+          </button>
+          <!-- HIF file chips injected by JS after scan -->
+        </div>
+        <div id="previewLoadingRow" class="preview-loading mt-2 hidden">
+          <i class="bi bi-hourglass-split"></i>
+          <span data-i18n="loadingPreview">Loading preview…</span>
+        </div>
       </div>
 
       <!-- Preset gallery -->
@@ -524,6 +551,9 @@ const S = {
     found: 'images found',         hifFound: 'HIF',
     hifDetected: 'HIF files detected — select a colour style below.',
     hifDetectedN: (n, t) => `${n} of ${t} files are HIF — select a colour style below.`,
+    previewWith: 'Preview with:',
+    samplePhoto: 'Sample photo',
+    loadingPreview: 'Loading preview…',
     noFolder: 'Please select the input folder',
     noOutput: 'Please select the output folder',
     errPfx: 'Error: ',
@@ -560,6 +590,9 @@ const S = {
     found: '張圖片',                 hifFound: 'HIF',
     hifDetected: '偵測到 HIF 檔案 — 請在下方選擇色彩風格。',
     hifDetectedN: (n, t) => `${t} 個檔案中有 ${n} 個為 HIF — 請在下方選擇色彩風格。`,
+    previewWith: '預覽圖片：',
+    samplePhoto: '示意照片',
+    loadingPreview: '載入預覽中…',
     noFolder: '請選擇來源資料夾',
     noOutput: '請選擇輸出資料夾',
     errPfx: '錯誤：',
@@ -660,18 +693,104 @@ async function scanFolder() {
       ? t('hifDetected')
       : t('hifDetectedN', d.hif_count, d.count);
     _lastHifInfo = msg;
-    showColourStyleCard(msg);
+    showColourStyleCard(msg, d.hif_files || [], d.hif_extra || 0);
   } else {
     hideColourStyleCard();
   }
 }
 
-function showColourStyleCard(msg) {
+function showColourStyleCard(msg, hifFiles, hifExtra) {
   document.getElementById('hifInfoText').textContent = msg;
   document.getElementById('colourStyleCard').classList.remove('hidden');
+  const inputFolder = document.getElementById('inputFolder').value.trim();
+  populatePreviewSelector(hifFiles || [], hifExtra || 0, inputFolder);
 }
 function hideColourStyleCard() {
   document.getElementById('colourStyleCard').classList.add('hidden');
+  useSamplePreview(); // reset to sample when card is hidden
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Preview photo selector
+// ══════════════════════════════════════════════════════════════
+let _previewMode = 'sample'; // 'sample' | 'custom'
+
+function populatePreviewSelector(hifFiles, hifExtra, inputFolder) {
+  const container = document.getElementById('previewChips');
+  // Remove all file chips, keep only the first (Sample photo) chip
+  [...container.querySelectorAll('.file-chip')].forEach(c => c.remove());
+  container.querySelector('.extra-note')?.remove();
+
+  const base = inputFolder.replace(/\\/g, '/').replace(/\/$/, '');
+
+  hifFiles.forEach(relPath => {
+    const parts    = relPath.replace(/\\/g, '/').split('/');
+    const filename = parts[parts.length - 1];
+    const fullPath = base + '/' + relPath.replace(/\\/g, '/');
+
+    const btn = document.createElement('button');
+    btn.className = 'preview-chip file-chip';
+    btn.title     = relPath;   // full relative path on hover
+    btn.innerHTML = `<i class="bi bi-file-earmark-image me-1"></i>${filename}`;
+    btn.addEventListener('click', () => loadCustomPreview(fullPath, btn));
+    container.appendChild(btn);
+  });
+
+  if (hifExtra > 0) {
+    const note = document.createElement('span');
+    note.className   = 'p-label ms-1 extra-note';
+    note.textContent = `+${hifExtra} more`;
+    container.appendChild(note);
+  }
+}
+
+async function loadCustomPreview(fullPath, btn) {
+  document.getElementById('previewLoadingRow').classList.remove('hidden');
+  document.querySelectorAll('.preview-chip').forEach(c => c.classList.remove('active'));
+  btn.classList.add('active');
+
+  const d = await fetch('/api/preview', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ file: fullPath }),
+  }).then(r => r.json()).catch(() => ({ ok: false }));
+
+  document.getElementById('previewLoadingRow').classList.add('hidden');
+
+  if (d.ok) {
+    _previewMode = 'custom';
+    // Update comparison slider to use the processed photo
+    document.getElementById('cBase').src = d.data;
+    document.getElementById('cTop').src  = d.data;
+    // Update gallery thumbnails: user's photo + each preset's CSS filter
+    document.querySelectorAll('.style-card').forEach(card => {
+      const img = card.querySelector('img');
+      const p   = PRESETS[card.dataset.style];
+      img.src         = d.data;
+      img.style.filter = p ? `contrast(${p.contrast}) saturate(${p.saturation})` : '';
+    });
+    updateLivePreview();
+    setSlider(50);
+  } else {
+    useSamplePreview(); // fall back if load failed
+  }
+}
+
+function useSamplePreview() {
+  _previewMode = 'sample';
+  document.querySelectorAll('.preview-chip').forEach(c => c.classList.remove('active'));
+  document.querySelector('#previewChips .preview-chip')?.classList.add('active');
+  // Restore comparison slider
+  document.getElementById('cBase').src = '/samples/sample_accurate.jpg';
+  document.getElementById('cTop').src  = '/samples/sample_accurate.jpg';
+  // Restore gallery thumbnails to pre-rendered samples
+  document.querySelectorAll('.style-card').forEach(card => {
+    const img = card.querySelector('img');
+    img.src          = `/samples/sample_${card.dataset.style}.jpg`;
+    img.style.filter = '';
+  });
+  updateLivePreview();
+  setSlider(50);
 }
 
 // ══════════════════════════════════════════════════════════════
