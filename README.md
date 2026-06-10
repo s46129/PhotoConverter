@@ -19,25 +19,46 @@ A Python toolkit for **colour-correct batch conversion and resizing** of photos 
 
 ### Web UI — `image_resizer.py`
 
-Run once, use from any browser:
+#### Step 1 — Download
 
-**Windows**
-```bat
-start_resizer.bat
+1. Click the green **Code** button near the top of this page → **Download ZIP**
+2. Extract the ZIP to any folder (e.g. your Desktop)
+3. Open the extracted `PhotoConverter` folder — the launcher files are right inside:
+
 ```
-or
+PhotoConverter/
+├── start_resizer.bat   ← double-click this on Windows
+├── start_resizer.sh    ← run this on macOS / Linux
+└── ...
+```
+
+#### Step 2 — One-time setup (first run only)
+
+**a) Install Python 3.10+**  
+Download from [python.org/downloads](https://www.python.org/downloads/) and run the installer.  
+On Windows: tick **"Add Python to PATH"** before clicking Install.
+
+**b) Install dependencies**  
+Open a terminal inside the `PhotoConverter` folder and run:
 ```bash
-python image_resizer.py
+pip install -r requirements.txt
 ```
+
+> **Windows tip:** hold `Shift` and right-click inside the folder → *Open PowerShell window here*, then paste the command above.  
+> **macOS tip:** open Terminal, type `cd ` (with a space), then drag the `PhotoConverter` folder into the Terminal window and press Enter.
+
+#### Step 3 — Launch
+
+**Windows** — double-click `start_resizer.bat`
 
 **macOS / Linux**
 ```bash
-chmod +x start_resizer.sh
+chmod +x start_resizer.sh   # one-time only
 ./start_resizer.sh
 ```
 
 The browser opens automatically at `http://localhost:5000`.  
-Press `Ctrl+C` (or close the terminal) to stop the server.
+Press `Ctrl+C` (or close the terminal window) to stop the server.
 
 #### Supported formats
 
@@ -206,25 +227,46 @@ MIT © 2026 Rex Ying (ted56129@gmail.com)
 
 ### 網頁介面 — `image_resizer.py`
 
-啟動一次，用瀏覽器操作：
+#### 步驟一：下載程式
 
-**Windows**
-```bat
-start_resizer.bat
+1. 點擊本頁上方綠色的 **Code** 按鈕 → **Download ZIP**
+2. 將 ZIP 解壓縮到任意位置（例如桌面）
+3. 開啟解壓縮後的 `PhotoConverter` 資料夾，啟動器就在裡面：
+
 ```
-或
+PhotoConverter/
+├── start_resizer.bat   ← Windows 請雙擊這個檔案
+├── start_resizer.sh    ← macOS / Linux 請執行這個
+└── ...
+```
+
+#### 步驟二：一次性設定（首次使用才需要）
+
+**a) 安裝 Python 3.10+**  
+前往 [python.org/downloads](https://www.python.org/downloads/) 下載並執行安裝程式。  
+Windows 安裝時請務必勾選 **「Add Python to PATH」** 再點擊 Install。
+
+**b) 安裝相依套件**  
+在 `PhotoConverter` 資料夾內開啟終端機，執行：
 ```bash
-python image_resizer.py
+pip install -r requirements.txt
 ```
+
+> **Windows 小技巧：** 在資料夾內按住 `Shift` 鍵並右鍵點擊空白處 → 選擇「在此處開啟 PowerShell 視窗」，貼上上方指令即可。  
+> **macOS 小技巧：** 開啟 Terminal，輸入 `cd `（注意後面有空格），再把 `PhotoConverter` 資料夾拖曳到 Terminal 視窗中，按 Enter 確認，再執行安裝指令。
+
+#### 步驟三：啟動
+
+**Windows** — 直接雙擊 `start_resizer.bat`
 
 **macOS / Linux**
 ```bash
-chmod +x start_resizer.sh
+chmod +x start_resizer.sh   # 只需執行一次
 ./start_resizer.sh
 ```
 
 瀏覽器會自動開啟 `http://localhost:5000`。  
-按 `Ctrl+C` 或關閉終端機視窗即可停止伺服器。
+按 `Ctrl+C` 或直接關閉終端機視窗即可停止伺服器。
 
 #### 支援格式
 
